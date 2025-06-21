@@ -20,6 +20,7 @@ sol! {
     error InsufficientAmount();
     error InsufficientLiquidityOwned();
     error FailedOrInsufficientTokenTransfer(address token, address from, address to, uint256 amount);
+    error FailedToReturnExtraEth(address to, uint256 amount);
     error TooMuchSlippage();
 }
 
@@ -52,7 +53,6 @@ sol_storage! {
         address owner;
         uint256 liquidity;
     }
-
 }
 
 #[derive(SolidityError)]
@@ -63,6 +63,7 @@ pub enum StylusSwapError {
     InsufficientLiquidityMinted(InsufficientLiquidityMinted),
     InsufficientLiquidityOwned(InsufficientLiquidityOwned),
     FailedOrInsufficientTokenTransfer(FailedOrInsufficientTokenTransfer),
+    FailedToReturnExtraEth(FailedToReturnExtraEth),
     TooMuchSlippage(TooMuchSlippage),
 }
 
@@ -103,7 +104,7 @@ impl StylusSwap {
         let (pool_id, token0, token1) = self.get_pool_id(token_a, token_b, fee);
         let existing_pool = self.pools.get(pool_id);
 
-        if !existing_pool.token0.is_zero() || !existing_pool.token1.is_zero() {
+        if !existing_pool.token0.get().is_zero() || !existing_pool.token1.get().is_zero() {
             return Err(StylusSwapError::PoolAlreadyExists(PoolAlreadyExists {
                 pool_id,
             }));
@@ -149,7 +150,7 @@ impl StylusSwap {
         let user_position = pool.positions.get(position_id);
         let user_liquidity = user_position.liquidity.get();
 
-        let is_initial_liquidity = liquidity == U256::from(0);
+        let is_initial_liquidity = liquidity.eq(&U256::ZERO);
 
         let (amount_0, amount_1) = self.get_liquidity_amounts(
             amount_0_desired,
@@ -161,7 +162,7 @@ impl StylusSwap {
         )?;
 
         let new_user_liquidity = if is_initial_liquidity {
-            self.integer_sqrt(amount_0 * amount_1)
+            self.integer_sqrt(amount_0 * amount_1) - U256::from(MIN_LIQUIDITY)
         } else {
             let l_0 = (amount_0 * liquidity) / balance_0;
             let l_1 = (amount_1 * liquidity) / balance_1;
@@ -200,6 +201,19 @@ impl StylusSwap {
                         amount: amount_0,
                     },
                 ));
+            }
+
+            let extra_eth = self.vm().msg_value() - amount_0;
+            if extra_eth > U256::ZERO {
+                let result = self.vm().transfer_eth(msg_sender, extra_eth);
+                if result.is_err() {
+                    return Err(StylusSwapError::FailedToReturnExtraEth(
+                        FailedToReturnExtraEth {
+                            to: msg_sender,
+                            amount: extra_eth,
+                        },
+                    ));
+                }
             }
         } else {
             let token_0_contract = IERC20::new(token0);
@@ -349,6 +363,12 @@ impl StylusSwap {
         let balance1 = pool.balance1.get();
         let fee = pool.fee.get();
 
+        if token0.is_zero() && token1.is_zero() {
+            return Err(StylusSwapError::PoolDoesNotExist(PoolDoesNotExist {
+                pool_id,
+            }));
+        }
+
         let k = balance0 * balance1;
 
         let input_token = if zero_for_one { token0 } else { token1 };
@@ -448,25 +468,24 @@ impl StylusSwap {
         balance_0: U256,
         balance_1: U256,
     ) -> Result<(U256, U256), StylusSwapError> {
-        let amount_1_given_0 = (amount_0_desired * balance_1) / balance_0;
-        let amount_0_given_1 = (amount_1_desired * balance_0) / balance_1;
-
-        if amount_1_given_0 <= amount_1_desired {
-            if amount_1_given_0 >= amount_1_min {
+        if balance_0.eq(&U256::ZERO) && balance_1.eq(&U256::ZERO) {
+            return Ok((amount_0_desired, amount_1_desired));
+        }
+        let amount_1_optimal = (amount_0_desired * balance_1) / balance_0;
+        if amount_1_optimal <= amount_1_desired {
+            if amount_1_optimal < amount_1_min {
                 return Err(StylusSwapError::InsufficientAmount(InsufficientAmount {}));
             }
-            return Ok((amount_0_desired, amount_1_given_0));
+
+            return Ok((amount_0_desired, amount_1_optimal));
         }
 
-        if amount_0_given_1 <= amount_0_desired {
+        let amount_0_optimal = (amount_1_desired * balance_0) / balance_1;
+        if amount_0_optimal < amount_0_min {
             return Err(StylusSwapError::InsufficientAmount(InsufficientAmount {}));
         }
 
-        if amount_0_given_1 >= amount_0_min {
-            return Err(StylusSwapError::InsufficientAmount(InsufficientAmount {}));
-        }
-
-        return Ok((amount_0_given_1, amount_1_desired));
+        return Ok((amount_0_optimal, amount_1_desired));
     }
 
     pub fn get_position_id(&self, pool_id: FixedBytes<32>, owner: Address) -> FixedBytes<32> {
@@ -503,17 +522,24 @@ impl StylusSwap {
         let pool_id = keccak(tx_hash_data_encode).into();
         (pool_id, token0, token1)
     }
+
+    pub fn get_position_liquidity(&self, pool_id: FixedBytes<32>, owner: Address) -> U256 {
+        let position_id = self.get_position_id(pool_id, owner);
+        let pool = self.pools.get(pool_id);
+        let position = pool.positions.get(position_id);
+        position.liquidity.get()
+    }
 }
 
 #[cfg(test)]
 mod test {
-
     use super::*;
     use alloy_primitives::address;
 
     #[test]
     fn test_create_pool() {
         use stylus_sdk::testing::*;
+
         let vm = TestVM::default();
         let mut contract = StylusSwap::from(&vm);
 
